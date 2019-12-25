@@ -7,144 +7,147 @@ from sklearn.feature_extraction import image
 
 import time
 from tqdm import tqdm
-import math
 
-DEBUG = True
+PROGRESS_BAR = True
+DEBUG_SAVE_IMG = False
 
 
-def SSD(Il, Ir, kernel_size, max_offset):
-    """
-    cost computation: sum of squared differences(SSD) method
-    """
+def evaluate(input_path, gt_path, scale_factor, threshold=1.0):
+    disp_gt = cv2.imread(gt_path, -1)
+    disp_gt = np.int32(disp_gt / scale_factor)
+    disp_input = cv2.imread(input_path, -1)
+    disp_input = np.int32(disp_input / scale_factor)
 
-    h, w, ch = Il.shape
-    half_kernel_width = int(kernel_size / 2)
+    nr_pixel = 0
+    nr_error = 0
+    h, w = disp_gt.shape
+    for y in range(0, h):
+        for x in range(0, w):
+            if disp_gt[y, x] > 0:
+                nr_pixel += 1
+                if np.abs(disp_gt[y, x] - disp_input[y, x]) > threshold:
+                    nr_error += 1
 
-    Il_grey = cv2.cvtColor(Il, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    Ir_grey = cv2.cvtColor(Ir, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-    # Il_grey = cv2.bilateralFilter(src=Il_grey, d=5, sigmaColor=21, sigmaSpace=21)
-    # Ir_grey = cv2.bilateralFilter(src=Ir_grey, d=5, sigmaColor=21, sigmaSpace=21)
-
-    # Il_grey = cv2.copyMakeBorder(
-    #     src=Il_grey,
-    #     top=half_kernel_width,
-    #     bottom=half_kernel_width,
-    #     left=half_kernel_width,
-    #     right=half_kernel_width,
-    #     borderType=cv2.BORDER_CONSTANT,
-    #     value=BLACK,
-    # )
-    # Ir_grey = cv2.copyMakeBorder(
-    #     src=Ir_grey,
-    #     top=half_kernel_width,
-    #     bottom=half_kernel_width,
-    #     left=half_kernel_width,
-    #     right=half_kernel_width,
-    #     borderType=cv2.BORDER_CONSTANT,
-    #     value=BLACK,
-    # )
-
-    # depth map
-    depth_map = np.zeros_like(Il_grey)
-
-    if DEBUG:
-        bar_y = tqdm(desc="SSD", total=h, position=0)
-
-    for y in range(half_kernel_width, h - half_kernel_width):
-        for x in range(half_kernel_width, w - half_kernel_width):
-            best_offset = 0
-            prev_ssd = 65534  # 256*256
-
-            for offset in range(max_offset):
-                # initialization
-                ssd = 0
-                ssd_temp = 0
-
-                # v and u are the x,y of our local window search, used to ensure a good
-                # match- going by the squared differences of two pixels alone is insufficient,
-                # we want to go by the squared differences of the neighbouring pixels too
-                for v in range(-half_kernel_width, half_kernel_width):
-                    for u in range(-half_kernel_width, half_kernel_width):
-                        # iteratively sum the sum of squared differences value for this block
-                        # left[] and right[] are arrays of uint8, so converting them to int saves
-                        # potential overflow, and executes a lot faster
-                        ssd_temp = int(Il_grey[y + v, x + u]) - int(
-                            Ir_grey[y + v, (x + u) - offset]
-                        )
-                        ssd += ssd_temp * ssd_temp
-
-                # if this value is smaller than the previous ssd at this block
-                # then it's theoretically a closer match. Store this value against
-                # this block..
-                if ssd < prev_ssd:
-                    prev_ssd = ssd
-                    best_offset = offset
-
-            # set depth_map output for the (x, y) pixel to the best match
-            depth_map[y, x] = best_offset
-
-        if DEBUG:
-            bar_y.update()
-    if DEBUG:
-        bar_y.close()
-
-    # map depth map output to 0-255 range
-    depth_map *= 255 / max_offset
-
-    return depth_map
+    return float(nr_error) / nr_pixel
 
 
 def computeDisp(Il, Ir, max_disp):
+
     h, w, ch = Il.shape
-    labels = np.zeros((h, w), dtype=np.float32)
-    # Il = Il.astype(np.float32)
-    # Ir = Ir.astype(np.float32)
+    kernel_size = 15  # should be odd
+    half_kernel_width = int(kernel_size / 2)
 
-    # >>> Cost computation
-    # TODO: Compute matching cost from Il and Ir
-    if DEBUG:
-        print(" ----- Cost Computation ----- ")
-        t_start = time.time()
+    # bilateral filter to smooth the image for a better result
+    Il_bilateral = cv2.bilateralFilter(src=Il, d=3, sigmaColor=21, sigmaSpace=21)
+    Ir_bilateral = cv2.bilateralFilter(src=Ir, d=3, sigmaColor=21, sigmaSpace=21)
 
-    labels = SSD(Il, Ir, kernel_size=6, max_offset=max_disp)
+    # convert images to greyscale
+    Il_grey = cv2.cvtColor(Il_bilateral, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    Ir_grey = cv2.cvtColor(Ir_bilateral, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    if DEBUG:
-        t_end = time.time()
-        print("Time: {:.2f} sec.".format(t_end - t_start))
+    # border padding
+    Il_pad = cv2.copyMakeBorder(
+        src=Il_grey,
+        top=half_kernel_width,
+        bottom=half_kernel_width,
+        left=half_kernel_width,
+        right=half_kernel_width,
+        borderType=cv2.BORDER_CONSTANT,
+        value=[0, 0, 0],  # black
+    )
+    Ir_pad = cv2.copyMakeBorder(
+        src=Ir_grey,
+        top=half_kernel_width,
+        bottom=half_kernel_width,
+        left=half_kernel_width + max_disp,
+        right=half_kernel_width,
+        borderType=cv2.BORDER_CONSTANT,
+        value=[0, 0, 0],  # black
+    )
 
-    # >>> Cost aggregation
-    # TODO: Refine cost by aggregate nearby costs
-    if DEBUG:
-        print(" ----- Cost Aggregation ----- ")
-        t_start = time.time()
+    # cost
+    sd_cost = np.zeros((h, w, max_disp + 1), dtype=np.float32)
+    windows_cost = np.zeros((h, w, max_disp + 1), dtype=np.float32)
 
-    if DEBUG:
-        t_end = time.time()
-        print("Time: {:.2f} sec.".format(t_end - t_start))
+    if PROGRESS_BAR:
+        pbar = tqdm(desc="SSD", total=max_disp + 1, position=0)
 
-    # >>> Disparity optimization
-    # TODO: Find optimal disparity based on estimated cost. Usually winner-take-all.
-    if DEBUG:
-        print(" ----- Disparity Optimization ----- ")
-        t_start = time.time()
+    # ----- cost computation -----
+    for offset in range(max_disp + 1):
+        # differences
+        img_diff = (
+            Il_pad
+            - Ir_pad[
+                :, max_disp - offset : max_disp - offset + w + 2 * half_kernel_width
+            ]
+        )
+        # squared differences
+        img_sd = img_diff ** 2
+        # img_sd = np.abs(img_diff)
 
-    if DEBUG:
-        t_end = time.time()
-        print("Time: {:.2f} sec.".format(t_end - t_start))
+        sd_cost[:, :, offset] = img_sd[
+            half_kernel_width:-half_kernel_width, half_kernel_width:-half_kernel_width
+        ]
 
-    # >>> Disparity refinement
-    # TODO: Do whatever to enhance the disparity map
-    # ex: Left-right consistency check + hole filling + weighted median filtering
-    if DEBUG:
-        print(" ----- Disparity Refinement ----- ")
-        t_start = time.time()
+        census_x = half_kernel_width
+        census_y = half_kernel_width
 
-    if DEBUG:
-        t_end = time.time()
-        print("Time: {:.2f} sec.".format(t_end - t_start))
+        for y in range(half_kernel_width, half_kernel_width + h):
+            for x in range(half_kernel_width, half_kernel_width + w):
+                # kernel window of both images
+                Il_window = Il_pad[
+                    y - half_kernel_width : y + half_kernel_width,
+                    x - half_kernel_width : x + half_kernel_width,
+                ]
+                Ir_window = Ir_pad[
+                    y - half_kernel_width : y + half_kernel_width,
+                    x
+                    + max_disp
+                    - half_kernel_width
+                    - offset : x
+                    + max_disp
+                    + half_kernel_width
+                    - offset,
+                ]
 
-    return labels.astype(np.uint8)
+                window_cost_temp = (Il_window != Ir_window).sum()
+                windows_cost[
+                    y - half_kernel_width, x - half_kernel_width, offset
+                ] = window_cost_temp
+
+        cost_map = 2 - np.exp(-sd_cost / 10) - np.exp(-windows_cost / 10)
+
+        if PROGRESS_BAR:
+            pbar.update()
+    if PROGRESS_BAR:
+        pbar.close()
+
+    # ----- cost aggregation -----
+    smooth_cost_map = np.empty_like(cost_map)
+    for offset in range(max_disp + 1):
+        # smooth the cost_map with guided filter and median filter
+        smooth_cost_map[:, :, offset] = cv2.ximgproc.guidedFilter(
+            guide=Il_grey, src=cost_map[:, :, offset], radius=8, eps=100, dDepth=-1
+        )
+        smooth_cost_map[:, :, offset] = cv2.medianBlur(
+            smooth_cost_map[:, :, offset], ksize=3
+        )
+
+    # ----- disparity optimization -----
+    min_cost_map = np.argmin(smooth_cost_map, axis=2)
+
+    # ----- disparity refinement -----
+    # smooth the disparity with median filter
+    disp_map = cv2.medianBlur(min_cost_map.astype(np.uint8), ksize=3)
+    # get rid of the leftmost black pixel
+    for offset in range(max_disp):
+        disp_map[:, offset] = disp_map[:, max_disp + 8]
+
+    if DEBUG_SAVE_IMG:
+        cv2.imwrite("./debug/tsukuba_min_cost.png", np.uint8(min_cost_map * 16))
+        cv2.imwrite("./debug/tsukuba_disp.png", np.uint8(disp_map * 16))
+
+    return disp_map.astype(np.uint8)
 
 
 def main():
@@ -155,6 +158,14 @@ def main():
     labels = computeDisp(img_left, img_right, max_disp)
     cv2.imwrite("./debug/tsukuba.png", np.uint8(labels * scale_factor))
 
+    print("[Bad Pixel Ratio]")
+    res = evaluate(
+        "./debug/tsukuba.png", "./testdata/tsukuba/disp3.pgm", scale_factor=16
+    )
+    print("Tsukuba: %.2f%%" % (res * 100))
+
 
 if __name__ == "__main__":
+    PROGRESS_BAR = True
+    DEBUG_SAVE_IMG = True
     main()
